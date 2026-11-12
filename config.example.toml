@@ -394,6 +394,13 @@ subtitle_provider = "edge"
 # "h264_mf", "h264_videotoolbox".
 # video_codec = "libx264"
 
+# Off by default. When true, a single clip that is already the canvas size,
+# 30 fps, H.264 yuv420p and no longer than the clip limit is copied instead of
+# re-encoded; the concat copies streams when every clip came from one encoder;
+# and with no subtitles to burn, the final video is muxed with the audio by
+# stream copy. Each skipped re-encode is a generation of quality kept.
+# encode_once = false
+
 # -----------------------------------------------------------------------------
 # Storage and Task Runtime / 存储与任务运行
 # -----------------------------------------------------------------------------

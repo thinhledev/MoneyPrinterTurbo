@@ -3,6 +3,8 @@ import io
 import math
 import os
 import random
+import re
+import shutil
 import gc
 import subprocess
 import sys
@@ -278,6 +280,133 @@ def _get_temp_audio_dir(output_dir: str) -> str:
     return output_dir
 
 
+# --- encode_once (opt-in, `[app] encode_once = true`) ---------------------------
+#
+# Every clip that reaches `combine_videos` is decoded and re-encoded by MoviePy,
+# the clips are re-encoded again by the ffmpeg concat, and `generate_video`
+# decodes and re-encodes the whole video once more to add the audio. For a
+# caller that hands the engine a finished clip of exactly the canvas, that is
+# three lossy generations of a picture that needed none: each costs about 2 dB
+# of text fidelity even at a low CRF, because it is a round trip through RGB.
+#
+# With the flag on, a ready clip is passed through untouched, the concat
+# copies streams when every input came from one writer, and the final file is
+# made by muxing the audio onto the video by stream copy when nothing is
+# burned into the picture. Off (the default), every path is exactly as before.
+
+#: The one frame rate the engine writes (`fps` above); a pass-through clip
+#: must already be at it, or the output would change rate silently.
+_READY_CLIP_FPS = 30
+#: The first video stream as `ffmpeg -i` prints it: codec name, then the pixel
+#: format after the codec's parenthesised details, e.g.
+#: `Video: h264 (High) (avc1 / 0x31637661), yuv420p(tv, bt709, progressive)`.
+_FFMPEG_VIDEO_STREAM = re.compile(r"Video: (\w+)[^,]*, (\w+)")
+
+
+def _encode_once_enabled() -> bool:
+    """Whether the caller opted in to `encode_once`. Read like `video_codec`."""
+    return bool(config.app.get("encode_once", False))
+
+
+def _probe_video_stream(video_path: str) -> tuple[str | None, str | None]:
+    """
+    `(codec name, pixel format)` of a file's first video stream, or `(None,
+    None)` when ffmpeg cannot say. MoviePy's infos parser has the codec but
+    not the pixel format, which decides whether a file can be copied into an
+    H.264 MP4 that every player decodes (yuv420p).
+    """
+    try:
+        result = subprocess.run(
+            [utils.get_ffmpeg_binary(), "-hide_banner", "-i", video_path],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+    match = _FFMPEG_VIDEO_STREAM.search(result.stderr or "")
+    if match is None:
+        return None, None
+    return match.group(1), match.group(2)
+
+
+def _is_ready_clip(
+    video_path: str,
+    *,
+    clip_duration: float,
+    clip_size: tuple[int, int],
+    clip_fps: float,
+    canvas: tuple[int, int],
+    max_clip_duration: float,
+) -> bool:
+    """
+    Whether a clip is already what `combine_videos` would make of it, so it
+    can be copied instead of re-encoded: the canvas size, the engine's frame
+    rate, no longer than the clip limit (so nothing would be trimmed), and
+    H.264 in yuv420p. The callers check the rest (one input, sequential, no
+    transition, normal speed).
+    """
+    if tuple(clip_size) != tuple(canvas):
+        return False
+    if abs(float(clip_fps or 0) - _READY_CLIP_FPS) > 0.01:
+        return False
+    if clip_duration > max_clip_duration:
+        return False
+    codec, pixel_format = _probe_video_stream(video_path)
+    return codec == "h264" and pixel_format == "yuv420p"
+
+
+def _mux_audio_by_copy(
+    *,
+    video_path: str,
+    audio_clip,
+    video_duration: float,
+    output_file: str,
+    audio_dir: str,
+    audio_fps: int,
+) -> bool:
+    """
+    The final file without re-encoding the picture: the audio is rendered
+    exactly as `write_videofile` would render it (same clip, codec, bitrate,
+    sample rate and buffer), then muxed onto the video by stream copy and cut
+    to the video's length, as MoviePy's own output is. True when the output
+    was written; False (logged) to let the caller fall back to MoviePy.
+    """
+    stem = os.path.splitext(os.path.basename(output_file))[0]
+    audio_file = os.path.join(audio_dir, f"{stem}-encode-once-audio.m4a")
+    try:
+        audio_clip.write_audiofile(
+            audio_file,
+            audio_fps,
+            4,
+            2000,
+            audio_codec,
+            bitrate=audio_bitrate,
+            logger=None,
+        )
+        command = [
+            utils.get_ffmpeg_binary(), "-y", "-loglevel", "error",
+            "-i", video_path, "-i", audio_file,
+            "-map", "0:v:0", "-map", "1:a:0", "-c", "copy",
+            "-t", f"{video_duration:.3f}", "-movflags", "+faststart",
+            output_file,
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            logger.warning(
+                "encode_once mux failed, writing the video with MoviePy instead: "
+                f"{(result.stderr or result.stdout or '').strip()[-500:]}"
+            )
+            return False
+        return True
+    except Exception:
+        logger.exception("encode_once mux failed, writing the video with MoviePy instead")
+        return False
+    finally:
+        delete_files(audio_file)
+
+
 def _fallback_write_videofile(clip, output_file: str, failed_codec: str, reason: str, **kwargs):
     """
     硬件编码失败后用 libx264 重试，只有重试成功才禁用该硬件编码器。
@@ -337,6 +466,7 @@ def concat_video_clips_with_ffmpeg(
     threads: int,
     output_dir: str,
     max_duration: float | None = None,
+    stream_copy: bool = False,
 ):
     concat_list_file = os.path.join(output_dir, "ffmpeg-concat-list.txt")
     with open(concat_list_file, "w", encoding="utf-8") as fp:
@@ -353,13 +483,24 @@ def concat_video_clips_with_ffmpeg(
             "0",
             "-i",
             concat_list_file,
-            "-c:v",
-            codec,
-            "-threads",
-            str(threads or 2),
-            "-pix_fmt",
-            "yuv420p",
         ]
+        if stream_copy:
+            # encode_once: every input came from one writer (or is one
+            # pass-through clip), so the streams already agree and a
+            # re-encode would only cost a generation. No audio, as the
+            # re-encoding path has none for MoviePy-written clips.
+            command.extend(["-map", "0:v", "-c", "copy", "-an"])
+        else:
+            command.extend(
+                [
+                    "-c:v",
+                    codec,
+                    "-threads",
+                    str(threads or 2),
+                    "-pix_fmt",
+                    "yuv420p",
+                ]
+            )
         if max_duration is not None and max_duration > 0:
             command.extend(["-t", f"{max_duration:.3f}"])
         command.append(output_file)
@@ -647,11 +788,35 @@ def combine_videos(
     processed_clips = []
     subclipped_items = []
     video_duration = 0
+    # encode_once: one ready clip is copied rather than re-encoded, and the
+    # concat copies streams when everything it joins came from one writer.
+    # `concat_sources` records the writer of each processed clip.
+    encode_once = _encode_once_enabled()
+    pass_through_paths = {}
+    concat_sources = set()
     for video_path in video_paths:
         clip = _open_video_clip_quietly(video_path)
         clip_duration = clip.duration
         clip_w, clip_h = clip.size
+        clip_fps = getattr(clip, "fps", None)
         close_clip(clip)
+
+        if (
+            encode_once
+            and len(video_paths) == 1
+            and video_concat_mode.value == VideoConcatMode.sequential.value
+            and normalized_clip_speed == 1.0
+            and transition_value in (None, VideoTransitionMode.none.value)
+            and _is_ready_clip(
+                video_path,
+                clip_duration=clip_duration,
+                clip_size=(clip_w, clip_h),
+                clip_fps=clip_fps,
+                canvas=(video_width, video_height),
+                max_clip_duration=source_clip_duration,
+            )
+        ):
+            pass_through_paths[video_path] = clip_duration
         
         start_time = 0
 
@@ -696,6 +861,30 @@ def combine_videos(
             f"remaining: {required_video_duration - video_duration:.2f}s"
         )
         
+        if (
+            subclipped_item.file_path in pass_through_paths
+            and subclipped_item.start_time == 0
+            and subclipped_item.end_time == pass_through_paths[subclipped_item.file_path]
+        ):
+            # Copied, not re-encoded: the clip is already exactly what the
+            # steps below would produce. Copied to the temp path rather than
+            # reused, because the processed clip files are deleted at the end.
+            clip_file = f"{output_dir}/temp-clip-{i+1}.mp4"
+            shutil.copyfile(subclipped_item.file_path, clip_file)
+            processed_clips.append(
+                SubClippedVideoClip(
+                    file_path=clip_file,
+                    duration=subclipped_item.duration,
+                    width=subclipped_item.width,
+                    height=subclipped_item.height,
+                    source_file_path=subclipped_item.source_file_path,
+                )
+            )
+            concat_sources.add("pass-through")
+            video_duration += subclipped_item.duration
+            logger.info(f"encode_once: passing {subclipped_item.file_path} through unchanged")
+            continue
+
         try:
             clip = _open_video_clip_quietly(subclipped_item.file_path).subclipped(
                 subclipped_item.start_time, subclipped_item.end_time
@@ -757,13 +946,16 @@ def combine_videos(
                 
             # wirte clip to temp file
             clip_file = f"{output_dir}/temp-clip-{i+1}.mp4"
-            _write_videofile_with_codec_fallback(
+            written_codec = _write_videofile_with_codec_fallback(
                 clip,
                 clip_file,
                 codec=_get_configured_video_codec(),
                 logger=None,
                 fps=fps,
             )
+            # A hardware encoder that fell back to libx264 part-way writes
+            # streams the concat cannot join by copy: count each writer.
+            concat_sources.add(written_codec or "unknown")
 
             # Store clip duration before closing
             clip_duration_saved = clip.duration
@@ -815,6 +1007,7 @@ def combine_videos(
         threads=threads,
         output_dir=output_dir,
         max_duration=audio_duration,
+        stream_copy=encode_once and len(concat_sources) == 1,
     )
     
     # clean temp files
@@ -1339,11 +1532,25 @@ def generate_video(
                     f"file={bgm_file}"
                 )
 
-        final_video_clip = video_clip.with_audio(audio_clip)
-        clip_stack.callback(final_video_clip.close)
         # 显式沿用输入音频的采样率；如果取不到，再回退 MoviePy 默认的 44100Hz。
         # 这样可以减少不同环境，尤其 Docker 中再次重采样带来的音质波动。
         output_audio_fps = int(getattr(audio_clip, "fps", 0) or 44100)
+        if _encode_once_enabled() and video_clip is source_video_clip:
+            # Nothing is drawn onto the picture (no subtitle file), so the
+            # video is copied and only the audio is encoded. Any failure
+            # falls back to the MoviePy write below: never a failed render.
+            if _mux_audio_by_copy(
+                video_path=video_path,
+                audio_clip=audio_clip,
+                video_duration=source_video_clip.duration,
+                output_file=output_file,
+                audio_dir=_get_temp_audio_dir(output_dir),
+                audio_fps=output_audio_fps,
+            ):
+                return bgm_mix_succeeded
+
+        final_video_clip = video_clip.with_audio(audio_clip)
+        clip_stack.callback(final_video_clip.close)
         _write_videofile_with_codec_fallback(
             final_video_clip,
             output_file=output_file,
